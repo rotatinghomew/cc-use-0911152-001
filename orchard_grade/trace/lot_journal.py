@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
 from orchard_grade.contracts.batches import Decision, DomainRecord, ContractError, canonical_json, stable_hash, utc_now
-from orchard_grade.inspection.receipts import InspectionReceipt, prepare_receipts, record_receipt, receipts_for_lot
+from orchard_grade.inspection.receipts import (InspectionReceipt, InspectionRevision, evidence_snapshot,
+                                               prepare_receipts, record_receipt, record_revision,
+                                               receipts_for_lot, revisions_for_lot)
 from orchard_grade.operations.packhouse_queue import QueueAssignment, assign_released_lot, prepare_queue
 
 
@@ -88,28 +90,55 @@ class Repository:
             prepare_receipts(connection)
             prepare_queue(connection)
 
-    def add_inspection(self, receipt: InspectionReceipt) -> bool:
+    def add_inspection(self, receipt: InspectionReceipt, revision: InspectionRevision | None = None) -> bool:
+        """Persist a receipt plus its evidence snapshot (and optional revision).
+
+        The service layer wraps this with stratum re-assessment so that peers'
+        review work stays consistent; this method remains the narrow storage step.
+        """
+
         with self.transaction() as connection:
-            row = connection.execute("SELECT payload_json FROM records WHERE record_id=?", (receipt.lot_id,)).fetchone()
-            if row is None:
-                raise ContractError("inspection lot does not exist")
-            payload = json.loads(row[0])
-            if str(payload.get("origin_code")) != receipt.origin_code:
-                raise ContractError("inspection origin disagrees with lot")
-            return record_receipt(connection, receipt)
+            return self.record_inspection(connection, receipt, revision)
+
+    def record_inspection(self, connection: sqlite3.Connection, receipt: InspectionReceipt,
+                          revision: InspectionRevision | None = None) -> bool:
+        row = connection.execute("SELECT payload_json FROM records WHERE record_id=?",
+                                 (receipt.lot_id,)).fetchone()
+        if row is None:
+            raise ContractError("inspection lot does not exist")
+        payload = json.loads(row[0])
+        if str(payload.get("origin_code")) != receipt.origin_code:
+            raise ContractError("inspection origin disagrees with lot")
+        if revision is not None and revision.lot_id != receipt.lot_id:
+            raise ContractError("inspection revision belongs to another lot")
+        snapshot = evidence_snapshot(DomainRecord(receipt.lot_id, payload),
+                                     machine_grade=receipt.machine_grade)
+        inserted = record_receipt(connection, receipt, evidence=snapshot)
+        if revision is not None:
+            record_revision(connection, revision)
+        return inserted
 
     def inspection_rows(self, lot_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:
             return receipts_for_lot(connection, lot_id)
 
+    def revision_rows(self, lot_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            return revisions_for_lot(connection, lot_id)
+
     def dispatch(self, lot_id: str) -> QueueAssignment:
+        from orchard_grade.disputes import context as dispute_context
+        from orchard_grade.disputes import store as dispute_store
+        from orchard_grade.disputes.service import check_clearance
         with self.transaction() as connection:
-            row = connection.execute("SELECT * FROM records WHERE record_id=?", (lot_id,)).fetchone()
-            if row is None:
-                raise ContractError("dispatch lot does not exist")
-            record = DomainRecord(row["record_id"], json.loads(row["payload_json"]),
-                                  row["state"], row["version"], row["occurred_at"], row["source"])
-            return assign_released_lot(connection, record)
+            record = dispute_context.load_record(connection, lot_id)
+            if record.state == "recalled":
+                # Recalled lots go straight to hold; this is not a release.
+                return assign_released_lot(connection, record)
+            analysis = dispute_context.analyse(connection, record)
+            check_clearance(analysis, "dispatch")
+            dispute_store.save_analysis(connection, analysis.as_record())
+            return assign_released_lot(connection, record, analysis.as_dict())
 
     def queue_rows(self) -> list[dict[str, Any]]:
         with self.connect() as connection:

@@ -9,14 +9,17 @@ from orchard_grade.trace.lot_journal import Repository
 from orchard_grade.operations.release_flow import advance_for_outcome, decide
 from orchard_grade.exports.packhouse import export_bundle, verify_bundle
 from orchard_grade.sensing.fusion import derive_context
-from orchard_grade.inspection.receipts import InspectionReceipt
+from orchard_grade.inspection.receipts import InspectionReceipt, InspectionRevision
 
 from orchard_grade.inspection.work_orders import InspectionWork
+from orchard_grade.disputes.service import DisputeService, check_clearance
+
 
 class Application:
     def __init__(self, database: str | Path, context: Mapping[str, Any] | None = None):
         self.repository = Repository(database)
         self.inspection_work = InspectionWork(self.repository)
+        self.disputes = DisputeService(self.repository)
         self.context = dict(context or {})
 
     def ingest(self, record: DomainRecord) -> DomainRecord:
@@ -68,11 +71,45 @@ class Application:
         return {"snapshot": self.repository.snapshot(), "records": [record.__dict__ for record in self.repository.list_records()],
                 "decisions": self.repository.decision_rows()}
 
-    def receive_inspection(self, receipt: InspectionReceipt) -> bool:
-        return self.repository.add_inspection(receipt)
+    def receive_inspection(self, receipt: InspectionReceipt,
+                           revision: InspectionRevision | None = None) -> bool:
+        # New human evidence shifts the stratum statistics, so peers are
+        # re-assessed in the same transaction rather than left with stale work.
+        return bool(self.disputes.receive_inspection(receipt, revision)["inserted"])
 
     def dispatch(self, lot_id: str) -> dict[str, Any]:
         return self.repository.dispatch(lot_id).__dict__
+
+    def release(self, lot_id: str) -> dict[str, Any]:
+        """Move a graded lot to released only when dispute review permits it.
+
+        The record transition and its audit event are transactional; a lot with
+        open review work never reaches ``released``.
+        """
+
+        with self.repository.transaction() as connection:
+            record = self.repository.get_record(lot_id)
+            if record is None:
+                raise ContractError("release lot does not exist")
+            clearance = self.disputes.analyse_in(connection, record)
+            check_clearance(clearance, "release")
+            if record.state == "released":
+                raise ContractError("lot is already released")
+            if record.state == "recalled":
+                raise ContractError("recalled lot cannot be released")
+            released = record.with_state("released")
+            self.repository.save_record(released, expected_version=record.version)
+            return {"lot_id": lot_id, "state": released.state, "version": released.version,
+                    "clearance": clearance.as_dict()}
+
+    def analyse_disputes(self, lot_id: str) -> dict[str, Any]:
+        return self.disputes.analyse(lot_id)
+
+    def dispute_board(self) -> dict[str, Any]:
+        return self.disputes.board()
+
+    def trace_lot(self, lot_id: str) -> dict[str, Any]:
+        return self.disputes.trace(lot_id)
 
 
 def load_fixture(path: str | Path) -> dict[str, Any]:
